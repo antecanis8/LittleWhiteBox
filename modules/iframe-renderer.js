@@ -121,6 +121,37 @@ function releaseIframeBlob(iframe) {
     } catch (e) { console.warn({ source: import.meta.url, operation: "releaseIframeBlob" }, e); }
 }
 
+// winMap strongly retains the iframe's WindowProxy as a key. If we only remove the
+// <iframe> from the DOM, the detached Window/Document/V8 context stays reachable
+// through this Map and can never be collected (the historical memory leak).
+function releaseIframeMapping(iframe) {
+    if (!(iframe instanceof HTMLIFrameElement)) return;
+    let win = null;
+    try { win = iframe.contentWindow; } catch (e) { console.warn({ source: import.meta.url, operation: "releaseIframeMapping" }, e); }
+    if (!win) return;
+    const rec = winMap.get(win);
+    if (rec && rec.iframe === iframe) winMap.delete(win);
+}
+
+function disposeIframe(iframe) {
+    if (!(iframe instanceof HTMLIFrameElement)) return;
+    releaseIframeMapping(iframe);
+    try { iframe.src = 'about:blank'; } catch (e) { console.warn({ source: import.meta.url, operation: "disposeIframe" }, e); }
+    releaseIframeBlob(iframe);
+    iframe.remove();
+}
+
+// Safety net: ST can replace message DOM (or users/other extensions can remove
+// wrappers) without going through our cleanup paths. Any mapping whose iframe is
+// no longer in the document is dead weight and must be dropped.
+function pruneStaleIframeMappings() {
+    for (const [win, rec] of winMap) {
+        if (!rec || !rec.iframe || !rec.iframe.isConnected) {
+            winMap.delete(win);
+        }
+    }
+}
+
 export function clearBlobCaches() {
     try { xbLog.info(MODULE_ID, '清空 Blob 缓存'); } catch (error) { console.warn({ source: import.meta.url, operation: 'clearBlobCaches' }, error); }
     hashToBlobUrl.forEach(u => { try { URL.revokeObjectURL(u); } catch (caughtError) { console.warn({ source: import.meta.url, operation: "clearBlobCaches" }, caughtError); } });
@@ -454,7 +485,7 @@ function getOrCreateWrapper(preEl) {
 function registerIframeMapping(iframe, wrapper) {
     const tryMap = () => {
         try {
-            if (iframe && iframe.contentWindow) {
+            if (iframe && iframe.isConnected && iframe.contentWindow) {
                 winMap.set(iframe.contentWindow, { iframe, wrapper });
                 return true;
             }
@@ -607,11 +638,7 @@ export function renderHtmlInIframe(htmlContent, container, preElement) {
         const iframe = createRenderIframe();
         
         const wrapper = getOrCreateWrapper(preElement);
-        wrapper.querySelectorAll('.xiaobaix-iframe').forEach(old => {
-            try { old.src = 'about:blank'; } catch (e) { console.warn({ source: import.meta.url, operation: "renderHtmlInIframe" }, e); }
-            releaseIframeBlob(old);
-            old.remove();
-        });
+        wrapper.querySelectorAll('.xiaobaix-iframe').forEach(old => disposeIframe(old));
 
         wrapper.appendChild(iframe);
         preElement.classList.remove('xb-show');
@@ -676,8 +703,10 @@ export function processCodeBlocks(messageElement, forceFinal = true) {
                 renderHtmlInIframe(html, preElement.parentNode, preElement);
             } else {
                 preElement.classList.add('xb-show');
-                preElement.removeAttribute('data-xbfinal');
-                preElement.removeAttribute('data-xbhash');
+                preElement.removeAttribute('data-xb-final');
+                preElement.removeAttribute('data-xb-hash');
+                delete preElement.dataset.xbFinal;
+                delete preElement.dataset.xbHash;
                 preElement.style.display = '';
             }
             preElement.dataset.xiaobaixBound = 'true';
@@ -690,8 +719,25 @@ export function processCodeBlocks(messageElement, forceFinal = true) {
 export function processExistingMessages() {
     const settings = getSettings();
     if (!settings.enabled) return;
-    document.querySelectorAll('.mes_text').forEach(el => processCodeBlocks(el, true));
+    // Only process messages that will survive shrinkRenderedWindowFull(). Rendering
+    // every .mes_text first and then deleting the out-of-window iframes produced a
+    // 60-iframe churn every 30s (and leaked each removed iframe's window).
+    const max = Number.isFinite(settings.maxRenderedMessages) && settings.maxRenderedMessages > 0
+        ? settings.maxRenderedMessages
+        : 0;
+    const chatArr = getContext?.()?.chat;
+    const keepFrom = (max > 0 && Array.isArray(chatArr))
+        ? Math.max(0, chatArr.length - max)
+        : 0;
+    document.querySelectorAll('div.mes').forEach(mes => {
+        const mesIdAttr = mes.getAttribute('mesid');
+        const mesId = mesIdAttr == null ? NaN : Number(mesIdAttr);
+        if (Number.isFinite(mesId) && keepFrom > 0 && mesId < keepFrom) return;
+        const mesText = mes.querySelector('.mes_text');
+        if (mesText) processCodeBlocks(mesText, true);
+    });
     try { shrinkRenderedWindowFull(); } catch (e) { console.warn({ source: import.meta.url, operation: "processExistingMessages" }, e); }
+    try { pruneStaleIframeMappings(); } catch (e) { console.warn({ source: import.meta.url, operation: "processExistingMessages" }, e); }
 }
 
 export function processMessageById(messageId, forceFinal = true) {
@@ -705,10 +751,7 @@ export function invalidateMessage(messageId) {
     const el = document.querySelector(`div.mes[mesid="${messageId}"] .mes_text`);
     if (!el) return;
     el.querySelectorAll('.xiaobaix-iframe-wrapper').forEach(w => {
-        w.querySelectorAll('.xiaobaix-iframe').forEach(ifr => {
-            try { ifr.src = 'about:blank'; } catch (e) { console.warn({ source: import.meta.url, operation: "invalidateMessage" }, e); }
-            releaseIframeBlob(ifr);
-        });
+        w.querySelectorAll('.xiaobaix-iframe').forEach(ifr => disposeIframe(ifr));
         w.remove();
     });
     el.querySelectorAll('pre').forEach(pre => {
@@ -724,10 +767,7 @@ export function invalidateMessage(messageId) {
 
 export function invalidateAll() {
     document.querySelectorAll('.xiaobaix-iframe-wrapper').forEach(w => {
-        w.querySelectorAll('.xiaobaix-iframe').forEach(ifr => {
-            try { ifr.src = 'about:blank'; } catch (e) { console.warn({ source: import.meta.url, operation: "invalidateAll" }, e); }
-            releaseIframeBlob(ifr);
-        });
+        w.querySelectorAll('.xiaobaix-iframe').forEach(ifr => disposeIframe(ifr));
         w.remove();
     });
     document.querySelectorAll('.mes_text pre').forEach(pre => {
@@ -768,10 +808,7 @@ function shrinkRenderedWindowForLastMessage() {
         const mesText = mes.querySelector('.mes_text');
         if (!mesText) continue;
         mesText.querySelectorAll('.xiaobaix-iframe-wrapper').forEach(w => {
-            w.querySelectorAll('.xiaobaix-iframe').forEach(ifr => {
-                try { ifr.src = 'about:blank'; } catch (e) { console.warn({ source: import.meta.url, operation: "shrinkRenderedWindowForLastMessage" }, e); }
-                releaseIframeBlob(ifr);
-            });
+            w.querySelectorAll('.xiaobaix-iframe').forEach(ifr => disposeIframe(ifr));
             w.remove();
         });
         mesText.querySelectorAll('pre[data-xiaobaix-bound="true"]').forEach(pre => {
@@ -809,10 +846,7 @@ function shrinkRenderedWindowFull() {
         const mesText = mes.querySelector('.mes_text');
         if (!mesText) continue;
         mesText.querySelectorAll('.xiaobaix-iframe-wrapper').forEach(w => {
-            w.querySelectorAll('.xiaobaix-iframe').forEach(ifr => {
-                try { ifr.src = 'about:blank'; } catch (e) { console.warn({ source: import.meta.url, operation: "shrinkRenderedWindowFull" }, e); }
-                releaseIframeBlob(ifr);
-            });
+            w.querySelectorAll('.xiaobaix-iframe').forEach(ifr => disposeIframe(ifr));
             w.remove();
         });
         mesText.querySelectorAll('pre[data-xiaobaix-bound="true"]').forEach(pre => {
